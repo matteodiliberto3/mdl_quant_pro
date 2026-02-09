@@ -9,7 +9,7 @@ from datetime import datetime
 # CONFIGURAZIONE FINANCE PRO DASHBOARD ⚡ (MDL Quant 4.0 Edition)
 # ==================================================================================
 FTMO_ACCOUNT_ID = 1521076547
-FTMO_PASSWORD = "tua_password"
+FTMO_PASSWORD = "J39NF**Ud"
 FTMO_SERVER = "FTMO-Demo2"
 
 ACCOUNT_SIZE = 100000.0
@@ -39,7 +39,7 @@ WARMUP_PERIOD = 200
 class MDL_Quant_Engine_V2:
     @staticmethod
     def calculate_hurst(ts):
-        """Valida se lo spread è realmente Mean-Reverting"""
+      #  """Valida se lo spread è realmente Mean-Reverting"""
         if len(ts) < 100:
             return 0.5
         lags = range(2, 20)
