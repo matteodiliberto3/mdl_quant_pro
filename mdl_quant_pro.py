@@ -49,7 +49,7 @@ class MDL_Quant_Engine_V2:
 
     @staticmethod
     def kalman_update(y, x, state, P, delta=1e-5, R=1e-3):
-        [cite_start]  # "Stima dinamica dell'Hedge Ratio [cite: 22, 23]"
+        # "Stima dinamica dell'Hedge Ratio [cite: 22, 23]"
         H = np.array([x, 1.0])
         P = P + (np.eye(2) * delta)
         y_pred = np.dot(H, state)
@@ -62,7 +62,7 @@ class MDL_Quant_Engine_V2:
 
     @staticmethod
     def get_ou_parameters(residuals):
-        [cite_start]  # "Modellazione OU per Capital Velocity [cite: 29]"
+        # "Modellazione OU per Capital Velocity [cite: 29]"
         if len(residuals) < 30:
             return None
         y, x = residuals[1:], residuals[:-1]
