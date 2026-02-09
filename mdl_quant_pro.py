@@ -1,21 +1,20 @@
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
-from scipy.stats import norm
 import time
 from datetime import datetime
+# Necessaria: pip install statsmodels
+from statsmodels.tsa.stattools import adfuller
 
 # ==================================================================================
-# CONFIGURAZIONE FINANCE PRO DASHBOARD ⚡ (MDL Quant 4.0 Execution-Ready)
+# CONFIGURAZIONE DINAMICA FINANCE PRO DASHBOARD ⚡
 # ==================================================================================
 FTMO_ACCOUNT_ID = 1521076547
 FTMO_PASSWORD = "J39NF**Ud"
 FTMO_SERVER = "FTMO-Demo2"
 
-ACCOUNT_SIZE = 100000.0
-TRADING_MODE = 1  # 1: Fase 1, 2: Fase 2, 3: Live
+PATH_MT5 = None  # Inserire percorso se MT5 non viene rilevato automaticamente
 
-# Portfolio con Volatilità Normalizzata
 PAIRS = [
     ("EURUSD", "GBPUSD", 1.0),
     ("XAUUSD", "XAGUSD", 0.5),
@@ -23,29 +22,28 @@ PAIRS = [
     ("BTCUSD", "ETHUSD", 0.01)
 ]
 
-# Parametri operativi MDL Quant 4.0 [cite: 30, 41, 48, 49]
-MAX_HALF_LIFE = 15          # Vincolo Capital Velocity [cite: 30]
-Z_ENTRY = 2.0               # Soglia ingresso [cite: 48]
-Z_EXIT = 0.5                # Banda di Isteresi [cite: 49]
-HURST_THRESHOLD = 0.45      # Filtro Stazionarietà (Wall Street Correction)
-BETA_SMOOTHING = 5          # Anti Over-fitting (Wall Street Correction)
+# Parametri Strategia MDL Quant 4.0
+MAX_HALF_LIFE = 15
+Z_ENTRY = 2.0
+Z_EXIT = 0.5
+HURST_THRESHOLD = 0.45
+BETA_SMOOTHING = 5
 TIMEFRAME = mt5.TIMEFRAME_H1
-WARMUP_PERIOD = 200
 
-# Limiti Hard di Drawdown FTMO [cite: 58]
-DAILY_LOSS_LIMIT_PCT = 0.04  # Stop al 4% (Buffer di sicurezza)
-TOTAL_LOSS_LIMIT_PCT = 0.09  # Stop al 9% (Buffer di sicurezza)
+# Sicurezza FTMO
+DAILY_LOSS_LIMIT_PCT = 0.04
+TOTAL_LOSS_LIMIT_PCT = 0.09
+INITIAL_DYNAMIC_BALANCE = 0.0
 
 # ==================================================================================
-# MOTORE QUANTISTICO (CORE)
+# CORE MATEMATICO RAFFINATO
 # ==================================================================================
 
 
-class MDL_Quant_Engine_V2:
+class MDL_Engine:
     @staticmethod
     def calculate_hurst(ts):
-        """Valida se lo spread è realmente Mean-Reverting"""
-        if len(ts) < 100:
+        if len(ts) < 50:
             return 0.5
         lags = range(2, 20)
         tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag])))
@@ -54,7 +52,6 @@ class MDL_Quant_Engine_V2:
 
     @staticmethod
     def kalman_update(y, x, state, P, delta=1e-5, R=1e-3):
-        """Stima dinamica dell'Hedge Ratio beta [cite: 23]"""
         H = np.array([x, 1.0])
         P = P + (np.eye(2) * delta)
         y_pred = np.dot(H, state)
@@ -67,17 +64,27 @@ class MDL_Quant_Engine_V2:
 
     @staticmethod
     def get_ou_parameters(residuals):
-        """Modellazione OU e Half-Life [cite: 29]"""
         if len(residuals) < 30:
             return None
         y, x = residuals[1:], residuals[:-1]
         b, a = np.polyfit(x, y, 1)
         theta = -np.log(abs(b)) if abs(b) > 0 else 0
-        half_life = np.log(2) / theta if theta > 0 else 999
-        return {"theta": theta, "half_life": half_life}
+        return {"half_life": np.log(2)/theta if theta > 0 else 999}
+
+    @staticmethod
+    def check_cointegration(residuals):
+        """Verifica se la relazione tra i due asset è statisticamente stabile."""
+        if len(residuals) < 100:
+            return False
+        try:
+            # Test di Dickey-Fuller Aumentato: p-value < 0.05 indica stazionarietà
+            result = adfuller(residuals)
+            return result[1] < 0.05
+        except:
+            return False
 
 # ==================================================================================
-# GESTORE OPERATIVO CON ISTERESI E SIZING [cite: 45, 55]
+# GESTORE OPERATIVO CON FILTRI STATISTICI
 # ==================================================================================
 
 
@@ -85,186 +92,165 @@ class PairHandler:
     def __init__(self, a, b, mult):
         self.a, self.b, self.mult = a, b, mult
         self.state, self.P = np.zeros(2), np.eye(2)
-        self.residuals, self.beta_history = [], []
+        self.residuals, self.beta_hist = [], []
         self.active_trade = 0
-        self.last_z, self.last_hurst, self.last_hl = 0.0, 0.5, 0.0
+        self.z, self.hurst, self.hl = 0, 0.5, 0
+        self.is_coint = False
+        self.last_coint_check = 0
 
     def on_tick(self):
         tA, tB = mt5.symbol_info_tick(self.a), mt5.symbol_info_tick(self.b)
         if not tA or not tB:
             return
 
-        # 1. Update Matematico
         pA, pB = (tA.bid + tA.ask)/2, (tB.bid + tB.ask)/2
-        self.state, self.P, err, std_err = MDL_Quant_Engine_V2.kalman_update(
+
+        # Aggiornamento Filtro di Kalman (Stima del Beta dinamico)
+        self.state, self.P, err, std_err = MDL_Engine.kalman_update(
             pA, pB, self.state, self.P)
 
-        # Smoothing del Beta per stabilità del bilanciamento
-        self.beta_history.append(self.state[0])
-        if len(self.beta_history) > BETA_SMOOTHING:
-            self.beta_history.pop(0)
-        current_beta = np.mean(self.beta_history)
+        self.beta_hist.append(self.state[0])
+        if len(self.beta_hist) > BETA_SMOOTHING:
+            self.beta_hist.pop(0)
 
         self.residuals.append(err)
         if len(self.residuals) > 500:
             self.residuals.pop(0)
-        if len(self.residuals) < 50:
+
+        if len(self.residuals) < 100:
             return
 
-        # 2. Analisi Segnale [cite: 35, 37]
-        self.last_z = err / std_err
-        ou = MDL_Quant_Engine_V2.get_ou_parameters(np.array(self.residuals))
-        self.last_hl = ou['half_life'] if ou else 999
-        self.last_hurst = MDL_Quant_Engine_V2.calculate_hurst(self.residuals)
+        # Calcoli Statistici
+        self.z = err / std_err
+        ou = MDL_Engine.get_ou_parameters(np.array(self.residuals))
+        self.hl = ou['half_life'] if ou else 999
+        self.hurst = MDL_Engine.calculate_hurst(self.residuals)
 
-        # 3. Logica Entry con filtri di qualità [cite: 30, 48, 50]
+        # Verifica Cointegrazione ogni 300 tick per risparmiare CPU
+        if time.time() - self.last_coint_check > 300:
+            self.is_coint = MDL_Engine.check_cointegration(self.residuals)
+            self.last_coint_check = time.time()
+
+        # LOGICA DI INGRESSO (Mean Reversion pura)
         if self.active_trade == 0:
-            if self.last_hl <= MAX_HALF_LIFE and self.last_hurst < HURST_THRESHOLD:
-                if abs(self.last_z) > Z_ENTRY:
-                    side = -1 if self.last_z > Z_ENTRY else 1
-                    self.execute_spread(current_beta, side)
+            if self.is_coint and self.hl <= MAX_HALF_LIFE and self.hurst < HURST_THRESHOLD:
+                if abs(self.z) > Z_ENTRY:
+                    self.execute(np.mean(self.beta_hist), -
+                                 1 if self.z > 0 else 1)
 
-        # 4. Logica Exit con Isteresi (Anti-Churning) [cite: 47, 49, 51]
+        # LOGICA DI USCITA
         else:
-            if (self.active_trade == -1 and self.last_z < Z_EXIT) or \
-               (self.active_trade == 1 and self.last_z > -Z_EXIT) or \
-               (abs(self.last_z) > 4.5):
-                self.close_positions("Mean Reversion / Hard Stop")
+            # Uscita a target (Z_EXIT) o per sicurezza se il trade diverge troppo (Z > 4.5)
+            if (self.active_trade == -1 and self.z < Z_EXIT) or \
+               (self.active_trade == 1 and self.z > -Z_EXIT) or abs(self.z) > 4.5:
+                self.close()
 
-    def execute_spread(self, beta, side):
-        # Sizing semplificato (0.1 lotti base) - VaR-Capping applicato nel main [cite: 56]
-        lot_a = 0.1
-        lot_b = round(abs(lot_a * beta), 2)
-
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] 🚀 ENTRY {'SHORT' if side == -1 else 'LONG'} {self.a}/{self.b} | Z:{self.last_z:.2f} | H:{self.last_hurst:.2f}")
-
-        # Esecuzione Atomica (Anti-Leg-Risk)
-        success_a = send_order(self.a, 1 if side == -1 else 0, lot_a)
-        if success_a:
-            success_b = send_order(self.b, 0 if side == -1 else 1, lot_b)
-            if not success_b:
-                print("⚠️ ERRORE CRITICO: Gamba B fallita. Kill-Switch attivo!")
-                close_symbol_positions(self.a)
-            else:
+    def execute(self, beta, side):
+        lot = 0.05  # Gestione lotti base
+        if self.order(self.a, 1 if side == -1 else 0, lot):
+            # Il lotto della gamba B è pesato sul Beta calcolato da Kalman
+            lot_b = abs(lot * beta)
+            if self.order(self.b, 0 if side == -1 else 1, lot_b):
                 self.active_trade = side
-        else:
-            print(f"❌ Apertura Gamba A ({self.a}) fallita.")
+                print(
+                    f"[{datetime.now().strftime('%H:%M:%S')}] ✅ ENTRY {self.a}/{self.b} | Z: {self.z:.2f} | Beta: {beta:.2f}")
+            else:
+                self.close()
 
-    def close_positions(self, reason):
-        print(
-            f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 EXIT {self.a}/{self.b} | Reason: {reason}")
-        close_symbol_positions(self.a)
-        close_symbol_positions(self.b)
+    def order(self, sym, typ, vol):
+        t = mt5.symbol_info_tick(sym)
+        # Protezione volumi: minimo 0.01 lotti
+        vol = max(float(round(vol, 2)), 0.01)
+        r = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": sym,
+            "volume": vol,
+            "type": mt5.ORDER_TYPE_BUY if typ == 0 else mt5.ORDER_TYPE_SELL,
+            "price": t.ask if typ == 0 else t.bid,
+            "magic": 999,
+            "type_filling": mt5.ORDER_FILLING_IOC,
+            "deviation": 10
+        }
+        res = mt5.order_send(r)
+        if res.retcode != mt5.TRADE_RETCODE_DONE:
+            print(f"❌ Errore Ordine su {sym}: {res.comment}")
+        return res.retcode == mt5.TRADE_RETCODE_DONE
+
+    def close(self):
+        for s in [self.a, self.b]:
+            positions = mt5.positions_get(symbol=s)
+            if positions:
+                for p in positions:
+                    if p.magic == 999:
+                        t = mt5.symbol_info_tick(s)
+                        type_close = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
+                        price_close = t.bid if type_close == mt5.ORDER_TYPE_SELL else t.ask
+                        mt5.order_send({
+                            "action": mt5.TRADE_ACTION_DEAL,
+                            "symbol": s,
+                            "volume": p.volume,
+                            "type": type_close,
+                            "position": p.ticket,
+                            "price": price_close,
+                            "magic": 999,
+                            "type_filling": mt5.ORDER_FILLING_IOC
+                        })
         self.active_trade = 0
-
-# ==================================================================================
-# PROTEZIONE CAPITALE E UTILITY MT5 [cite: 54, 58]
-# ==================================================================================
-
-
-def check_account_safety():
-    """Monitoraggio Drawdown Hard Limits [cite: 58]"""
-    acc = mt5.account_info()
-    if not acc:
-        return False
-
-    total_dd = (ACCOUNT_SIZE - acc.equity) / ACCOUNT_SIZE
-    daily_dd = (acc.balance - acc.equity) / \
-        acc.balance if acc.equity < acc.balance else 0
-
-    if total_dd >= TOTAL_LOSS_LIMIT_PCT or daily_dd >= DAILY_LOSS_LIMIT_PCT:
         print(
-            f"🚨!!! DRAWDOWN LIMIT HIT ({max(total_dd, daily_dd)*100:.1f}%) !!!")
-        close_all_panic()
-        return False
-    return True
-
-
-def send_order(symbol, type_op, vol):
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        return False
-    req = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(vol),
-        "type": mt5.ORDER_TYPE_BUY if type_op == 0 else mt5.ORDER_TYPE_SELL,
-        "price": tick.ask if type_op == 0 else tick.bid,
-        "magic": 123456,
-        "comment": "MDL Quant V4",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    res = mt5.order_send(req)
-    return res.retcode == mt5.TRADE_RETCODE_DONE
-
-
-def close_symbol_positions(symbol):
-    positions = mt5.positions_get(symbol=symbol)
-    if positions:
-        for pos in positions:
-            tick = mt5.symbol_info_tick(symbol)
-            type_close = mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-            req = {
-                "action": mt5.TRADE_ACTION_DEAL,
-                "symbol": symbol,
-                "volume": pos.volume,
-                "type": type_close,
-                "position": pos.ticket,
-                "price": tick.bid if type_close == mt5.ORDER_TYPE_SELL else tick.ask,
-                "magic": 123456
-            }
-            mt5.order_send(req)
-
-
-def close_all_panic():
-    print("🧹 Emergency Liquidating all positions...")
-    pos = mt5.positions_get()
-    if pos:
-        for p in pos:
-            close_symbol_positions(p.symbol)
+            f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 TARGET/EXIT {self.a}/{self.b}")
 
 # ==================================================================================
-# LOOP PRINCIPALE
+# MAIN ENGINE CON FIX CONNESSIONE
 # ==================================================================================
 
 
 def main():
-    if not mt5.initialize():
+    global INITIAL_DYNAMIC_BALANCE
+    print(f"--- FINANCE PRO DASHBOARD ⚡ INITIALIZING ---")
+
+    # Inizializzazione robusta
+    init_params = {"server": FTMO_SERVER,
+                   "login": FTMO_ACCOUNT_ID, "password": FTMO_PASSWORD}
+    if PATH_MT5:
+        init_params["path"] = PATH_MT5
+
+    if not mt5.initialize(**init_params):
+        print(
+            f"❌ ERRORE CRITICO: Inizializzazione fallita. Codice errore: {mt5.last_error()}")
         return
-    if not mt5.login(FTMO_ACCOUNT_ID, FTMO_PASSWORD, FTMO_SERVER):
-        print("❌ Login Fallito")
+
+    # Verifica stato connessione
+    acc = mt5.account_info()
+    if acc is None:
+        print(
+            f"❌ LOGIN FALLITO: Credenziali errate o server {FTMO_SERVER} non raggiungibile.")
         mt5.shutdown()
         return
 
-    print(f"🚀 FINANCE PRO DASHBOARD ⚡ - MDL QUANT 4.0")
+    INITIAL_DYNAMIC_BALANCE = acc.balance
     print(
-        f"🛡️ SAFETY: Daily {DAILY_LOSS_LIMIT_PCT*100}% | Total {TOTAL_LOSS_LIMIT_PCT*100}%")
-    print("-" * 50)
+        f"✅ CONNESSO: {acc.name} | Conto: {INITIAL_DYNAMIC_BALANCE} {acc.currency}")
 
     handlers = [PairHandler(p[0], p[1], p[2]) for p in PAIRS]
-    last_diag = 0
 
     try:
         while True:
-            if not check_account_safety():
-                print("⛔ SISTEMA BLOCCATO PER PROTEZIONE CAPITALE.")
-                break
+            # Controllo Equity per Sicurezza FTMO
+            curr = mt5.account_info()
+            if curr:
+                drawdown = (INITIAL_DYNAMIC_BALANCE -
+                            curr.equity) / INITIAL_DYNAMIC_BALANCE
+                if drawdown >= TOTAL_LOSS_LIMIT_PCT:
+                    print(
+                        f"🚨 EMERGENCY STOP: Drawdown raggiunto ({drawdown*100:.2f}%)!")
+                    break
 
             for h in handlers:
                 h.on_tick()
 
-            if time.time() - last_diag > 60:
-                print(
-                    f"\n--- MONITOR [{datetime.now().strftime('%H:%M:%S')}] ---")
-                for h in handlers:
-                    print(
-                        f"[{h.a}/{h.b}] Z:{h.last_z:>6.2f} | H:{h.last_hurst:>5.2f} | HL:{h.last_hl:>5.1f} | Trade:{h.active_trade}")
-                last_diag = time.time()
-
-            time.sleep(1)
+            time.sleep(1)  # Rispetto del rate-limit
     except KeyboardInterrupt:
-        print("\n🛑 Stop manuale.")
-        close_all_panic()
+        print("🛑 Script interrotto dall'utente.")
     finally:
         mt5.shutdown()
 
