@@ -3,17 +3,17 @@ import pandas as pd
 import numpy as np
 import time
 from datetime import datetime
-# Necessaria: pip install statsmodels
+import concurrent.futures
 from statsmodels.tsa.stattools import adfuller
+from statsmodels.stats.diagnostic import acorr_ljungbox
+from scipy.stats import norm
 
 # ==================================================================================
-# CONFIGURAZIONE DINAMICA FINANCE PRO DASHBOARD ⚡
+# CONFIGURAZIONE FINANCE PRO DASHBOARD ⚡ (INSTITUTIONAL GRADE)
 # ==================================================================================
-FTMO_ACCOUNT_ID = 1521076547
-FTMO_PASSWORD = "J39NF**Ud"
+FTMO_ACCOUNT_ID = 1521085130
+FTMO_PASSWORD = "$2p*I!V$2Dpp?"
 FTMO_SERVER = "FTMO-Demo2"
-
-PATH_MT5 = None  # Inserire percorso se MT5 non viene rilevato automaticamente
 
 PAIRS = [
     ("EURUSD", "GBPUSD", 1.0),
@@ -22,236 +22,358 @@ PAIRS = [
     ("BTCUSD", "ETHUSD", 0.01)
 ]
 
-# Parametri Strategia MDL Quant 4.0
-MAX_HALF_LIFE = 15
+# --- Parametri Quantitativi ---
+# [FIX 1] Unità temporale esplicita: Candele (Minuti su M1)
+MAX_HALF_LIFE_CANDLES = 20  # Max 20 minuti per il mean reversion atteso
+MIN_CONFIDENCE = 0.60
 Z_ENTRY = 2.0
 Z_EXIT = 0.5
-HURST_THRESHOLD = 0.45
-BETA_SMOOTHING = 5
-TIMEFRAME = mt5.TIMEFRAME_H1
+MIN_LOOKBACK = 100
+MAX_LOOKBACK = 300
 
-# Sicurezza FTMO
+# --- Risk Management FTMO ---
 DAILY_LOSS_LIMIT_PCT = 0.04
 TOTAL_LOSS_LIMIT_PCT = 0.09
-INITIAL_DYNAMIC_BALANCE = 0.0
+VAR_CONFIDENCE = 1.96       # 95% Confidence Interval
+MAX_SWAP_IMPACT = 0.2
+
+# [FIX 3] Blacklist per coppie con rottura strutturale (Structural Break)
+BLACKLIST = set()
 
 # ==================================================================================
-# CORE MATEMATICO RAFFINATO
+# MODULO ORNSTEIN-UHLENBECK
 # ==================================================================================
 
 
-class MDL_Engine:
+class OrnsteinUhlenbeck:
     @staticmethod
-    def calculate_hurst(ts):
-        if len(ts) < 50:
-            return 0.5
-        lags = range(2, 20)
-        tau = [np.sqrt(np.std(np.subtract(ts[lag:], ts[:-lag])))
-               for lag in lags]
-        return np.polyfit(np.log(lags), np.log(tau), 1)[0]
+    def fit(spread_series, dt=1.0):
+        # dt = 1.0 implica che theta è in unità "per barra" (per minuto su M1)
+        x_t = spread_series[:-1].values
+        dx_t = spread_series[1:].values - x_t
+
+        A = np.vstack([x_t, np.ones(len(x_t))]).T
+        beta, alpha = np.linalg.lstsq(A, dx_t, rcond=None)[0]
+
+        theta = -beta / dt
+        mu = alpha / (theta * dt) if abs(theta) > 1e-5 else 0
+
+        residuals = dx_t - (alpha + beta * x_t)
+        sigma = np.std(residuals) / np.sqrt(dt)
+
+        return theta, mu, sigma
 
     @staticmethod
-    def kalman_update(y, x, state, P, delta=1e-5, R=1e-3):
-        H = np.array([x, 1.0])
-        P = P + (np.eye(2) * delta)
-        y_pred = np.dot(H, state)
-        error = y - y_pred
-        S = np.dot(H, np.dot(P, H.T)) + R
-        K = np.dot(P, H.T) / S
-        new_state = state + K * error
-        new_P = np.dot(np.eye(2) - np.outer(K, H), P)
-        return new_state, new_P, error, np.sqrt(S)
+    def calculate_metrics(theta, mu, sigma, current_spread):
+        if theta <= 1e-5:
+            return 999, 0.0
 
-    @staticmethod
-    def get_ou_parameters(residuals):
-        if len(residuals) < 30:
-            return None
-        y, x = residuals[1:], residuals[:-1]
-        b, a = np.polyfit(x, y, 1)
-        theta = -np.log(abs(b)) if abs(b) > 0 else 0
-        return {"half_life": np.log(2)/theta if theta > 0 else 999}
+        hl = np.log(2) / theta
 
+        sigma_eq = sigma / np.sqrt(2 * theta)
+        distance = abs(current_spread - mu)
+        p_conv = 2 * (1 - norm.cdf(distance / sigma_eq))
+
+        return hl, p_conv
+
+# ==================================================================================
+# CLASSE KALMAN FILTER
+# ==================================================================================
+
+
+class KalmanFilterReg:
+    def __init__(self):
+        self.delta = 1e-4
+        self.wt = self.delta / (1 - self.delta) * np.eye(2)
+        self.vt = 1e-3
+        self.theta = np.zeros(2)
+        self.P = np.zeros((2, 2))
+        self.R = None
+
+    def update(self, x, y):
+        F = np.asarray([x, 1.0]).reshape(1, 2)
+        y = np.asarray(y)
+
+        if self.R is None:
+            self.R = np.zeros((2, 2))
+            self.theta = np.zeros(2)
+
+        y_hat = F @ self.theta
+        e = y - y_hat
+        Q = self.P + self.wt
+        R_val = self.vt
+
+        K = Q @ F.T / (F @ Q @ F.T + R_val)
+        self.theta = self.theta + (K.flatten() * e)
+        self.P = (np.eye(2) - K @ F) @ Q
+
+        return self.theta[0], self.theta[1], e
+
+# ==================================================================================
+# RISK MANAGER
+# ==================================================================================
+
+
+class RiskManager:
     @staticmethod
-    def check_cointegration(residuals):
-        """Verifica se la relazione tra i due asset è statisticamente stabile."""
-        if len(residuals) < 100:
+    def check_drawdown_limits(initial_balance, current_equity):
+        drawdown = (initial_balance - current_equity) / initial_balance
+        if drawdown >= TOTAL_LOSS_LIMIT_PCT:
+            print(
+                f"🚨 CRITICAL: Max Drawdown raggiunto ({drawdown:.2%}). STOP TRADING.")
             return False
-        try:
-            # Test di Dickey-Fuller Aumentato: p-value < 0.05 indica stazionarietà
-            result = adfuller(residuals)
-            return result[1] < 0.05
-        except:
+        return True
+
+    @staticmethod
+    def calculate_convex_size(equity, initial_balance, sigma_ou, point_value_a):
+        # [FIX 2] Nota sulla Volatilità:
+        # sigma_ou è calcolata sugli ultimi 300 min (Regime Intraday Corrente).
+        # Scalare per sqrt(1440) proietta questo regime su base giornaliera.
+        # È una stima conservativa se il mercato è in un regime di alta volatilità.
+
+        limit_equity = initial_balance * (1 - TOTAL_LOSS_LIMIT_PCT)
+        distance_to_ruin = max(0, equity - limit_equity)
+
+        if distance_to_ruin <= 0:
+            return 0.0
+
+        vol_daily = sigma_ou * np.sqrt(1440)
+        var_price_impact = vol_daily * VAR_CONFIDENCE
+        var_money_per_lot = var_price_impact * point_value_a
+
+        if var_money_per_lot == 0:
+            return 0.0
+
+        kelly_fraction = 0.1
+        raw_risk_capital = distance_to_ruin * kelly_fraction
+        lot_size = raw_risk_capital / var_money_per_lot
+
+        lot_size = min(10.0, lot_size)
+        return max(0.01, np.floor(lot_size * 100) / 100)
+
+    @staticmethod
+    def check_swap_costs(symbol_a, symbol_b, side_a):
+        s_a = mt5.symbol_info(symbol_a)
+        s_b = mt5.symbol_info(symbol_b)
+        if not s_a or not s_b:
             return False
 
+        swap_a = s_a.swap_long if side_a == 'buy' else s_a.swap_short
+        swap_b = s_b.swap_short if side_a == 'buy' else s_b.swap_long
+
+        total_swap = swap_a + swap_b
+        if total_swap < -5.0:
+            # print(f"⚠️ SWAP SKIP {symbol_a}/{symbol_b}: {total_swap}")
+            return False
+        return True
+
 # ==================================================================================
-# GESTORE OPERATIVO CON FILTRI STATISTICI
+# CORE LOGIC
 # ==================================================================================
 
 
-class PairHandler:
-    def __init__(self, a, b, mult):
-        self.a, self.b, self.mult = a, b, mult
-        self.state, self.P = np.zeros(2), np.eye(2)
-        self.residuals, self.beta_hist = [], []
-        self.active_trade = 0
-        self.z, self.hurst, self.hl = 0, 0.5, 0
-        self.is_coint = False
-        self.last_coint_check = 0
+def process_pair(pair_config, account_currency, initial_balance):
+    asset_a, asset_b, initial_hedge = pair_config
+    pair_id = f"{asset_a}/{asset_b}"
 
-    def on_tick(self):
-        tA, tB = mt5.symbol_info_tick(self.a), mt5.symbol_info_tick(self.b)
-        if not tA or not tB:
+    # [FIX 3] Check Blacklist
+    if pair_id in BLACKLIST:
+        return
+
+    # Data Check
+    if not mt5.symbol_info(asset_a).visible:
+        mt5.symbol_select(asset_a, True)
+    if not mt5.symbol_info(asset_b).visible:
+        mt5.symbol_select(asset_b, True)
+
+    rates_a = mt5.copy_rates_from_pos(
+        asset_a, mt5.TIMEFRAME_M1, 0, MAX_LOOKBACK)
+    rates_b = mt5.copy_rates_from_pos(
+        asset_b, mt5.TIMEFRAME_M1, 0, MAX_LOOKBACK)
+
+    if rates_a is None or rates_b is None or len(rates_a) != len(rates_b):
+        return
+
+    df = pd.DataFrame({'A': [x['close'] for x in rates_a], 'B': [
+                      x['close'] for x in rates_b]})
+
+    # Kalman
+    kf = KalmanFilterReg()
+    spreads = []
+    betas = []
+
+    for i in range(len(df)):
+        b, alpha, e = kf.update(df['B'].iloc[i], df['A'].iloc[i])
+        s = df['A'].iloc[i] - (b * df['B'].iloc[i])
+        spreads.append(s)
+        betas.append(b)
+
+    current_spread = spreads[-1]
+    current_beta = betas[-1]
+    series_spread = pd.Series(spreads[-100:])
+
+    # Diagnostica
+    try:
+        adf = adfuller(series_spread)
+        adf_p = adf[1]
+
+        theta, mu, sigma_ou = OrnsteinUhlenbeck.fit(series_spread)
+        half_life, p_conv = OrnsteinUhlenbeck.calculate_metrics(
+            theta, mu, sigma_ou, current_spread)
+    except:
+        return
+
+    # [FIX 1] Filtro Half-Life in Candele
+    if adf_p > 0.05:
+        return
+    if half_life > MAX_HALF_LIFE_CANDLES:
+        return
+
+    # Z-Score
+    mean = series_spread.mean()
+    std = series_spread.std()
+    if std == 0:
+        return
+    z_score = (current_spread - mean) / std
+
+    # Execution Logic
+    positions = mt5.positions_get(symbol=asset_a)
+    has_pos = len(positions) > 0
+
+    if not has_pos:
+        if abs(z_score) > Z_ENTRY:
+            point_value = mt5.symbol_info(asset_a).point
+            acc_info = mt5.account_info()
+            lot_size = RiskManager.calculate_convex_size(
+                acc_info.equity, initial_balance, std, point_value)
+
+            if lot_size >= 0.01:
+                if z_score > Z_ENTRY and RiskManager.check_swap_costs(asset_a, asset_b, 'sell'):
+                    print(
+                        f"📉 OPEN SHORT {asset_a}/{asset_b} | Z:{z_score:.2f} | HL:{half_life:.1f}m | P:{p_conv:.0%}")
+                    execute_atomic_trade(
+                        asset_a, asset_b, mt5.ORDER_TYPE_SELL, lot_size, current_beta)
+                elif z_score < -Z_ENTRY and RiskManager.check_swap_costs(asset_a, asset_b, 'buy'):
+                    print(
+                        f"📈 OPEN LONG {asset_a}/{asset_b} | Z:{z_score:.2f} | HL:{half_life:.1f}m | P:{p_conv:.0%}")
+                    execute_atomic_trade(
+                        asset_a, asset_b, mt5.ORDER_TYPE_BUY, lot_size, current_beta)
+
+    else:
+        # Gestione Posizione Aperta
+        pos_type = positions[0].type
+
+        # [FIX 3] HARD STOP LOSS & BLACKLISTING
+        # Se Z esplode, qualcosa si è rotto strutturalmente.
+        if abs(z_score) > 4.5:
+            print(
+                f"💀 STRUCTURAL BREAK DETECTED {asset_a}/{asset_b} (Z={z_score:.2f})")
+            print(f"🚫 BLACKLISTING PAIR {pair_id} for this session.")
+            BLACKLIST.add(pair_id)
+            close_all_positions(asset_a, asset_b)
             return
 
-        pA, pB = (tA.bid + tA.ask)/2, (tB.bid + tB.ask)/2
+        # Take Profit standard (Isteresi)
+        if (pos_type == mt5.ORDER_TYPE_SELL and z_score < Z_EXIT) or \
+           (pos_type == mt5.ORDER_TYPE_BUY and z_score > -Z_EXIT):
+            print(f"💰 TAKE PROFIT {asset_a} | Z: {z_score:.2f}")
+            close_all_positions(asset_a, asset_b)
 
-        # Aggiornamento Filtro di Kalman (Stima del Beta dinamico)
-        self.state, self.P, err, std_err = MDL_Engine.kalman_update(
-            pA, pB, self.state, self.P)
+    # Monitor
+    if abs(z_score) > 1.5 and not has_pos:
+        print(f"👀 WATCH {asset_a} | Z:{z_score:.1f} | HL:{half_life:.1f}m | P:{p_conv:.0%} | Size:{lot_size if 'lot_size' in locals() else 'N/A'}")
 
-        self.beta_hist.append(self.state[0])
-        if len(self.beta_hist) > BETA_SMOOTHING:
-            self.beta_hist.pop(0)
 
-        self.residuals.append(err)
-        if len(self.residuals) > 500:
-            self.residuals.pop(0)
+def execute_atomic_trade(sym_a, sym_b, type_a, vol_a, beta):
+    vol_b = vol_a * abs(beta)
+    vol_b = max(0.01, round(vol_b, 2))
+    type_b = mt5.ORDER_TYPE_SELL if type_a == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
 
-        if len(self.residuals) < 100:
-            return
+    req_a = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": sym_a,
+        "volume": float(vol_a),
+        "type": type_a,
+        "price": mt5.symbol_info_tick(sym_a).ask if type_a == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(sym_a).bid,
+        "deviation": 10,
+        "type_filling": mt5.ORDER_FILLING_FOK,
+        "comment": "MDL Quant Inst",
+    }
 
-        # Calcoli Statistici
-        self.z = err / std_err
-        ou = MDL_Engine.get_ou_parameters(np.array(self.residuals))
-        self.hl = ou['half_life'] if ou else 999
-        self.hurst = MDL_Engine.calculate_hurst(self.residuals)
+    res_a = mt5.order_send(req_a)
+    if res_a.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"❌ Fail Leg A ({sym_a}): {res_a.comment}")
+        return
 
-        # Verifica Cointegrazione ogni 300 tick per risparmiare CPU
-        if time.time() - self.last_coint_check > 300:
-            self.is_coint = MDL_Engine.check_cointegration(self.residuals)
-            self.last_coint_check = time.time()
+    order_b_filled = False
+    for i in range(5):
+        req_b = req_a.copy()
+        req_b["symbol"] = sym_b
+        req_b["volume"] = float(vol_b)
+        req_b["type"] = type_b
+        req_b["price"] = mt5.symbol_info_tick(
+            sym_b).ask if type_b == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(sym_b).bid
 
-        # LOGICA DI INGRESSO (Mean Reversion pura)
-        if self.active_trade == 0:
-            if self.is_coint and self.hl <= MAX_HALF_LIFE and self.hurst < HURST_THRESHOLD:
-                if abs(self.z) > Z_ENTRY:
-                    self.execute(np.mean(self.beta_hist), -
-                                 1 if self.z > 0 else 1)
+        res_b = mt5.order_send(req_b)
+        if res_b.retcode == mt5.TRADE_RETCODE_DONE:
+            order_b_filled = True
+            break
+        time.sleep(0.05)
 
-        # LOGICA DI USCITA
-        else:
-            # Uscita a target (Z_EXIT) o per sicurezza se il trade diverge troppo (Z > 4.5)
-            if (self.active_trade == -1 and self.z < Z_EXIT) or \
-               (self.active_trade == 1 and self.z > -Z_EXIT) or abs(self.z) > 4.5:
-                self.close()
+    if not order_b_filled:
+        print(f"💀 CRITICAL LEGGING FAILURE: Closing {sym_a} NOW.")
+        # Chiusura forzata immediata
+        positions = mt5.positions_get(symbol=sym_a)
+        for p in positions:
+            req_c = {
+                "action": mt5.TRADE_ACTION_DEAL, "symbol": sym_a, "volume": p.volume,
+                "type": mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                "position": p.ticket, "price": mt5.symbol_info_tick(sym_a).bid if p.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(sym_a).ask
+            }
+            mt5.order_send(req_c)
 
-    def execute(self, beta, side):
-        lot = 0.05  # Gestione lotti base
-        if self.order(self.a, 1 if side == -1 else 0, lot):
-            # Il lotto della gamba B è pesato sul Beta calcolato da Kalman
-            lot_b = abs(lot * beta)
-            if self.order(self.b, 0 if side == -1 else 1, lot_b):
-                self.active_trade = side
-                print(
-                    f"[{datetime.now().strftime('%H:%M:%S')}] ✅ ENTRY {self.a}/{self.b} | Z: {self.z:.2f} | Beta: {beta:.2f}")
-            else:
-                self.close()
 
-    def order(self, sym, typ, vol):
-        t = mt5.symbol_info_tick(sym)
-        # Protezione volumi: minimo 0.01 lotti
-        vol = max(float(round(vol, 2)), 0.01)
-        r = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": sym,
-            "volume": vol,
-            "type": mt5.ORDER_TYPE_BUY if typ == 0 else mt5.ORDER_TYPE_SELL,
-            "price": t.ask if typ == 0 else t.bid,
-            "magic": 999,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-            "deviation": 10
-        }
-        res = mt5.order_send(r)
-        if res.retcode != mt5.TRADE_RETCODE_DONE:
-            print(f"❌ Errore Ordine su {sym}: {res.comment}")
-        return res.retcode == mt5.TRADE_RETCODE_DONE
-
-    def close(self):
-        for s in [self.a, self.b]:
-            positions = mt5.positions_get(symbol=s)
-            if positions:
-                for p in positions:
-                    if p.magic == 999:
-                        t = mt5.symbol_info_tick(s)
-                        type_close = mt5.ORDER_TYPE_SELL if p.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY
-                        price_close = t.bid if type_close == mt5.ORDER_TYPE_SELL else t.ask
-                        mt5.order_send({
-                            "action": mt5.TRADE_ACTION_DEAL,
-                            "symbol": s,
-                            "volume": p.volume,
-                            "type": type_close,
-                            "position": p.ticket,
-                            "price": price_close,
-                            "magic": 999,
-                            "type_filling": mt5.ORDER_FILLING_IOC
-                        })
-        self.active_trade = 0
-        print(
-            f"[{datetime.now().strftime('%H:%M:%S')}] 🔄 TARGET/EXIT {self.a}/{self.b}")
-
-# ==================================================================================
-# MAIN ENGINE CON FIX CONNESSIONE
-# ==================================================================================
+def close_all_positions(sym_a, sym_b):
+    for sym in [sym_a, sym_b]:
+        positions = mt5.positions_get(symbol=sym)
+        if positions:
+            for pos in positions:
+                req = {
+                    "action": mt5.TRADE_ACTION_DEAL, "symbol": sym, "volume": pos.volume,
+                    "type": mt5.ORDER_TYPE_SELL if pos.type == mt5.ORDER_TYPE_BUY else mt5.ORDER_TYPE_BUY,
+                    "position": pos.ticket, "price": mt5.symbol_info_tick(sym).bid if pos.type == mt5.ORDER_TYPE_BUY else mt5.symbol_info_tick(sym).ask
+                }
+                mt5.order_send(req)
 
 
 def main():
-    global INITIAL_DYNAMIC_BALANCE
-    print(f"--- FINANCE PRO DASHBOARD ⚡ INITIALIZING ---")
-
-    # Inizializzazione robusta
-    init_params = {"server": FTMO_SERVER,
-                   "login": FTMO_ACCOUNT_ID, "password": FTMO_PASSWORD}
-    if PATH_MT5:
-        init_params["path"] = PATH_MT5
-
-    if not mt5.initialize(**init_params):
-        print(
-            f"❌ ERRORE CRITICO: Inizializzazione fallita. Codice errore: {mt5.last_error()}")
+    if not mt5.initialize(login=FTMO_ACCOUNT_ID, password=FTMO_PASSWORD, server=FTMO_SERVER):
         return
-
-    # Verifica stato connessione
     acc = mt5.account_info()
-    if acc is None:
-        print(
-            f"❌ LOGIN FALLITO: Credenziali errate o server {FTMO_SERVER} non raggiungibile.")
-        mt5.shutdown()
-        return
+    initial_balance = acc.balance
+    print(f"✅ QUANT ENGINE (INSTITUTIONAL) READY. Bal: {initial_balance}")
+    print("------------------------------------------------------------------")
 
-    INITIAL_DYNAMIC_BALANCE = acc.balance
-    print(
-        f"✅ CONNESSO: {acc.name} | Conto: {INITIAL_DYNAMIC_BALANCE} {acc.currency}")
-
-    handlers = [PairHandler(p[0], p[1], p[2]) for p in PAIRS]
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(PAIRS))
 
     try:
         while True:
-            # Controllo Equity per Sicurezza FTMO
-            curr = mt5.account_info()
-            if curr:
-                drawdown = (INITIAL_DYNAMIC_BALANCE -
-                            curr.equity) / INITIAL_DYNAMIC_BALANCE
-                if drawdown >= TOTAL_LOSS_LIMIT_PCT:
-                    print(
-                        f"🚨 EMERGENCY STOP: Drawdown raggiunto ({drawdown*100:.2f}%)!")
-                    break
+            current_equity = mt5.account_info().equity
+            # Heartbeat informativo
+            now = datetime.now().strftime("%H:%M:%S")
+            print(
+                f"[{now}] 💓 Eq: {current_equity:.2f} | Actives: {len(PAIRS) - len(BLACKLIST)}/{len(PAIRS)}")
 
-            for h in handlers:
-                h.on_tick()
+            if not RiskManager.check_drawdown_limits(initial_balance, current_equity):
+                break
 
-            time.sleep(1)  # Rispetto del rate-limit
+            futures = []
+            for pair in PAIRS:
+                futures.append(executor.submit(
+                    process_pair, pair, acc.currency, initial_balance))
+            concurrent.futures.wait(futures)
+            time.sleep(60)
     except KeyboardInterrupt:
-        print("🛑 Script interrotto dall'utente.")
-    finally:
         mt5.shutdown()
 
 
